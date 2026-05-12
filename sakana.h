@@ -126,7 +126,7 @@ void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len
 int run_cmd(Cmd *cmd)
 {
     printf("run_cmd:");
-    for (size_t i = 0; i < cmd->len; i++) printf(" %s", cmd->items[i]);
+    foreach (char *, item, cmd) printf(" %s", *item);
     printf("\n");
     assert(cmd->len > 0);
     cmd_append(cmd, NULL);
@@ -166,6 +166,7 @@ static void sakana_atexit()
 
 void sakana_build_base(int argc, char **argv, char *src_path)
 {
+    (void)argc;
     sakana_arena = alloc_arena(KB(1));
     atexit(sakana_atexit);
 
@@ -178,6 +179,10 @@ void sakana_build_base(int argc, char **argv, char *src_path)
         Cmd cmd = {0};
         cmd_append(&cmd, "gcc");
         cmd_append(&cmd, src_path);
+        cmd_append(&cmd, "-Wall");
+        cmd_append(&cmd, "-Wextra");
+        cmd_append(&cmd, "-Wpedantic");
+        cmd_append(&cmd, "-Wconversion");
         cmd_append(&cmd, "-o");
         cmd_append(&cmd, bin_path);
         if (run_cmd(&cmd) == 0) {
