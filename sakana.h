@@ -11,6 +11,11 @@ typedef struct {
     uint8_t *data;
 } Arena;
 
+typedef struct {
+    size_t position;
+    size_t next_position;
+} Save;
+
 #ifdef DEBUG
 #include <stdio.h>
 #define LOG(FMT, ...) printf(FMT, __VA_ARGS__)
@@ -21,6 +26,8 @@ typedef struct {
 Arena alloc_arena(size_t size);
 Arena create_arena(void *ptr, size_t size);
 void delete_arena(Arena arena);
+Save quicksave(Arena arena);
+void quickload(Arena *arena, Save save);
 void *arena_base_alloc(Arena *arena, size_t size, size_t align);
 void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len, size_t align);
 #define arena_create(ARENA, TYPE) arena_base_alloc(ARENA, sizeof(TYPE), alignof(TYPE))
@@ -121,6 +128,17 @@ void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len
         memcpy(new_ptr, ptr, old_len);
     }
     return new_ptr;
+}
+
+Save quicksave(Arena arena)
+{
+    return (Save){ .position = arena.position, .next_position = arena.next_position };
+}
+
+void quickload(Arena *arena, Save save)
+{
+    arena->position = save.position;
+    arena->next_position = save.next_position;
 }
 
 int run_cmd(Cmd *cmd)
