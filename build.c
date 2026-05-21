@@ -16,6 +16,7 @@ int main(int argc, char **argv)
     cmd_append(&build, "-Wconversion");
     cmd_append(&build, "-lsqlite3");
     cmd_append(&build, "-lreadline");
+    cmd_append(&build, "-fsanitize=address");
     cmd_append(&build, "-o");
     cmd_append(&build, name);
     if (run_cmd(&build) == 0) {

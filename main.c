@@ -1,187 +1,206 @@
 #include <assert.h>
+#include <sqlite3.h>
+#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include <readline/readline.h>
-#include <sqlite3.h>
+#include <sys/stat.h>
 
-#define DEBUG
+// #define DEBUG
 #define SAKANA_IMPLEMENTATION
 #include "sakana.h"
 
-typedef struct {
-    char *string;
-    size_t len;
-} StringView;
+#define UNUSED(value) (void) value
+define_da(char *, Strings);
 
-StringView create_string_view(char *string)
+typedef struct DatabaseManager {
+    const char *file;
+    const char *sql_path;
+    sqlite3 *db;
+} DatabaseManager;
+
+bool is_file(const char *file)
 {
-    return (StringView) { .string = string, .len = strlen(string) };
+    struct stat buf;
+    if (stat(file, &buf) != 0)
+        return false;
+    return S_ISREG(buf.st_mode);
 }
 
-void strip(StringView *sv)
+DatabaseManager create_database_manager()
 {
-    while (sv->string[0] == ' ') {
-        sv->string++;
-        sv->len--;
-        if (sv->len == 0) break;
+    DatabaseManager self = { .file = "elo.db", .sql_path = "elo.sql" };
+    bool exist = is_file(self.file);
+    assert(sqlite3_open(self.file, &self.db) == SQLITE_OK);
+    if (!exist) {
+        const char *sql = "CREATE TABLE \"media\" (\n"
+                          "    \"id\"       INTEGER NOT NULL UNIQUE,\n"
+                          "    \"name\"     TEXT NOT NULL UNIQUE,\n"
+                          "    \"type\"     TEXT NOT NULL,\n"
+                          "    \"release\"  TEXT NOT NULL,\n"
+                          "    \"elo\"      INT NOT NULL DEFAULT 1000,\n"
+                          "    \"japanese\" INT NOT NULL,\n"
+                          "    \"note\"     TEXT,\n"
+                          "    PRIMARY KEY(\"id\" AUTOINCREMENT)\n"
+                          ") STRICT;\n"
+                          "CREATE TABLE \"log\" (\n"
+                          "    \"id\"               INTEGER NOT NULL UNIQUE,\n"
+                          "    \"timestamp\"        REAL NOT NULL UNIQUE,\n"
+                          "    \"kind\"             TEXT NOT NULL,\n"
+                          "    \"duration_seconds\" INTEGER NOT NULL,\n"
+                          "    \"parent_id\"        INTEGER,\n"
+                          "    \"characters\"       INTEGER,\n"
+                          "    \"page\"             INTEGER,\n"
+                          "    \"eps\"              REAL,\n"
+                          "    \"yt_id\"            TEXT,\n"
+                          "    \"yt_title\"         TEXT,\n"
+                          "    \"notes\"            TEXT,\n"
+                          "    PRIMARY KEY(\"id\" AUTOINCREMENT),\n"
+                          "    FOREIGN KEY(\"parent_id\") REFERENCES \"media\"(\"id\")\n"
+                          ") STRICT;\n";
+        assert(sqlite3_exec(self.db, sql, NULL, NULL, NULL) == SQLITE_OK);
     }
-    while (sv->string[sv->len - 1] == ' ') {
-        sv->len--;
-        if (sv->len == 0) break;
-    }
+    return self;
 }
 
-void usage(int argc, char *argv[])
+// WIP
+void destroy_database_manager(DatabaseManager self)
 {
-    (void)argc;
-    printf("usage: %s <command>\n\n", argv[0]);
-    printf("Available omoshiroi commands:\n");
-    printf("  add\t- Add media to the database\n");
-    printf("  elo\t- Play elo matches between media\n");
-    printf("  log\t- Log media\n");
-    printf("  stats\t- Show stats\n");
+    sqlite3_close(self.db);
 }
 
-int add_or_get_base(sqlite3 *db, char const *name, char const *table_name)
+char *arena_strdup(Arena *arena, const char *src)
+{
+    size_t n = strlen(src) + 1;
+    char *dest = arena_alloc(arena, char, n);
+    memcpy(dest, src, n);
+    return dest;
+}
+
+Strings get_names(Arena *arena, DatabaseManager dm)
 {
     sqlite3_stmt *stmt = NULL;
-    char sql[256] = {0};
-    sprintf(sql, "SELECT id FROM %s WHERE name = ?", table_name);
-    assert(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK);
-    assert(sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC) == SQLITE_OK);
-    int result;
-    int id = -1;
-    do {
-        result = sqlite3_step(stmt);
-        if (result == SQLITE_ROW) id = sqlite3_column_int(stmt, 0);
-        assert(result == SQLITE_ROW || result == SQLITE_DONE);
-    } while (result != SQLITE_DONE);
-    assert(sqlite3_finalize(stmt) == SQLITE_OK);
-    if (id == -1) {
-        sprintf(sql, "INSERT INTO %s (name) VALUES (?) RETURNING id", table_name);
-        assert(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK);
-        assert(sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC) == SQLITE_OK);
-        do {
-            result = sqlite3_step(stmt);
-            if (result == SQLITE_ROW) id = sqlite3_column_int(stmt, 0);
-            assert(result == SQLITE_ROW || result == SQLITE_DONE);
-        } while (result != SQLITE_DONE);
-        assert(sqlite3_finalize(stmt) == SQLITE_OK);
-        return id;
+    assert(sqlite3_prepare_v2(dm.db, "SELECT \"name\" FROM \"media\"", -1, &stmt, NULL) == SQLITE_OK);
+    Strings names = {};
+    int step;
+    while (true) {
+        step = sqlite3_step(stmt);
+        if (step == SQLITE_DONE)
+            break;
+        da_append(arena, &names, arena_strdup(arena, (const char *) sqlite3_column_text(stmt, 0)));
     }
-    return id;
+    assert(sqlite3_finalize(stmt) == SQLITE_OK);
+    return names;
 }
 
-int add_or_get_series(sqlite3 *db, char const *name)
+Strings get_types(Arena *arena, DatabaseManager dm)
 {
-    return add_or_get_base(db, name, "series");
+    sqlite3_stmt *stmt = NULL;
+    assert(sqlite3_prepare_v2(dm.db, "SELECT DISTINCT \"type\" FROM \"media\"", -1, &stmt, NULL) == SQLITE_OK);
+    Strings types = {};
+    int step;
+    while (true) {
+        step = sqlite3_step(stmt);
+        if (step == SQLITE_DONE)
+            break;
+        da_append(arena, &types, arena_strdup(arena, (const char *) sqlite3_column_text(stmt, 0)));
+    }
+    assert(sqlite3_finalize(stmt) == SQLITE_OK);
+    return types;
 }
 
-int add_or_get_type(sqlite3 *db, char const *name)
+// WIP
+void add(DatabaseManager dm, const char *media_name, const char *media_type, const char *media_release,
+         bool media_japanese, const char *media_note)
 {
-    return add_or_get_base(db, name, "type");
+    UNUSED(dm);
+    UNUSED(media_name);
+    UNUSED(media_type);
+    UNUSED(media_release);
+    UNUSED(media_japanese);
+    UNUSED(media_note);
 }
 
-int add_or_get_creator(sqlite3 *db, char const *name)
+Strings *compentry_func_strings;
+
+char *compentry_func(const char *text, int state)
 {
-    return add_or_get_base(db, name, "creator");
-}
-
-define_da(char *, Options);
-
-Options options;
-
-static char *series_generator(const char *text, int state)
-{
-    // it's work but I not sure how
-    static size_t len, i;
-    char *name = NULL;
-
+    static size_t i, n;
+    const char *s;
     if (!state) {
         i = 0;
-        len = strlen(text);
+        n = strlen(text);
     }
-
-    for (; i < options.len; i) {
-        char *name = options.items[i++];
-        if (strncmp(name, text, len) == 0) {
-            return strdup(name);
-        }
+    while (true) {
+        s = compentry_func_strings->items[i++];
+        if (i >= compentry_func_strings->len)
+            break;
+        if (strncmp(s, text, n) == 0)
+            return strdup(s);
     }
-
-    return ((char *)NULL);
+    return (char *) NULL;
 }
 
-static char **series_completion(const char *text, int start, int end)
+char **completion_function(const char *text, int start, int end)
 {
-    (void)start;
-    (void)end;
+    UNUSED(start);
+    UNUSED(end);
     rl_attempted_completion_over = 1;
     rl_completion_append_character = '\0';
     rl_completer_word_break_characters = "";
-    return rl_completion_matches(text, series_generator);
+    return rl_completion_matches(text, compentry_func);
 }
 
-// TODO: migrate from 0 to 1
-// TODO: create tables if not exist
+// WIP
+const char *prompt_readline(Arena *arena, const char *prompt, Strings options)
+{
+    UNUSED(options);
+    size_t n = strlen(prompt) + strlen(": ") + 1;
+    char *s = arena_alloc(arena, char *, n);
+    sprintf(s, "%s: ", prompt);
+    compentry_func_strings = &options;
+    rl_attempted_completion_function = completion_function;
+    const char *src = readline(s);
+    const char *result = arena_strdup(arena, src);
+    free((void *) src);
+    return result;
+}
 
-int main(int argc, char *argv[])
+// WIP
+const char *prompt_date(const char *prompt)
+{
+    UNUSED(promppt);
+    return "";
+}
+
+// WIP
+bool prompt_check(const char *prompt)
+{
+    UNUSED(prompt);
+    return true;
+}
+
+// WIP
+const char *prompt(const char *prompt, bool option)
+{
+    UNUSED(prompt);
+    UNUSED(option);
+    return "";
+}
+
+int main()
 {
     Arena arena = alloc_arena(MB(1));
-    sqlite3 *db = NULL;
-    assert(sqlite3_open("elo.db", &db) == SQLITE_OK);
-
-    da_append(&arena, &options, "ABC");
-    da_append(&arena, &options, "CBA");
-    da_append(&arena, &options, "ABCABC");
-    
-    int id = add_or_get_series(db, "hentai2");
-    printf("id: %d\n", id);
-
-    sqlite3_close(db);
-
-    if (argc == 1) {
-        usage(argc, argv);
-    } else if (argc > 1) {
-        if (strcmp(argv[1], "add") == 0) {
-            printf("add\n");
-            // rl_bind_key('\t', rl_insert);
-            rl_bind_key('\t', rl_complete);
-            rl_attempted_completion_function = series_completion;
-            char *name     = readline("name: "); // text
-            char *series   = readline("series: "); // key
-            char *kind     = readline("type: "); // key
-            char *release  = readline("release: "); // text
-            char *japanese = readline("japanese (y/n): "); // int
-            char *creator  = readline("creator: "); // key
-            char *source   = readline("source: "); // key
-            printf("name: %s\n", name);
-            printf("series: %s\n", series);
-            printf("kind: %s\n", kind);
-            printf("release: %s\n", release);
-            printf("japanese: %s\n", japanese);
-            printf("creator: %s\n", creator);
-            printf("source: %s\n", source);
-            free(name);
-            free(series);
-            free(kind);
-            free(release);
-            free(japanese);
-            free(creator);
-            free(source);
-        } else if (strcmp(argv[1], "elo") == 0) {
-            printf("elo\n");
-        } else if (strcmp(argv[1], "log") == 0) {
-            printf("log\n");
-        } else if (strcmp(argv[1], "stats") == 0) {
-            printf("stats\n");
-        } else {
-            usage(argc, argv);
-        }
-    }
-
+    DatabaseManager dm = create_database_manager();
+    // TODO: add args parsing instead of manual input
+    const char *media_name = prompt_readline(&arena, "Name", get_names(&arena, dm));
+    const char *media_type = prompt_readline(&arena, "Type", get_types(&arena, dm));
+    const char *media_release = prompt_date("Release");
+    bool media_japanese = prompt_check("Will I consume it in Japanese?");
+    const char *media_note = prompt("Note", true);
+    add(dm, media_name, media_type, media_release, media_japanese, media_note);
+    destroy_database_manager(dm);
     delete_arena(arena);
     return 0;
 }

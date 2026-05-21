@@ -21,7 +21,14 @@ typedef struct {
 #define LOG(FMT, ...) printf(FMT, __VA_ARGS__)
 #else
 #define LOG(FMT, ...)
-#endif // DEBUG
+#endif  // DEBUG
+
+#ifndef DEFAULT_ALIGNMENT
+#define DEFAULT_ALIGNMENT (2 * sizeof(void *))
+#endif
+
+#define KB(SIZE) (SIZE << 10)
+#define MB(SIZE) (KB(SIZE) << 10)
 
 Arena alloc_arena(size_t size);
 Arena create_arena(void *ptr, size_t size);
@@ -30,32 +37,31 @@ Save quicksave(Arena arena);
 void quickload(Arena *arena, Save save);
 void *arena_base_alloc(Arena *arena, size_t size, size_t align);
 void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len, size_t align);
-#define arena_create(ARENA, TYPE) arena_base_alloc(ARENA, sizeof(TYPE), alignof(TYPE))
-#define arena_alloc(ARENA, TYPE, LEN) arena_base_alloc(ARENA, LEN * sizeof(TYPE), alignof(TYPE))
-#define arena_realloc(ARENA, PTR, OLD_LEN, NEW_LEN) arena_base_realloc(ARENA, PTR,                       \
-                                                                       OLD_LEN * sizeof(typeof(PTR[0])), \
-                                                                       NEW_LEN * sizeof(typeof(PTR[0])), \
-                                                                       alignof(typeof(PTR[0])))
+#define arena_create(ARENA, TYPE) arena_base_alloc(ARENA, sizeof(TYPE), DEFAULT_ALIGNMENT)
+#define arena_alloc(ARENA, TYPE, LEN) arena_base_alloc(ARENA, LEN * sizeof(TYPE), DEFAULT_ALIGNMENT)
+#define arena_realloc(ARENA, PTR, OLD_LEN, NEW_LEN)                                                    \
+    arena_base_realloc(ARENA, PTR, OLD_LEN * sizeof(typeof(PTR[0])), NEW_LEN * sizeof(typeof(PTR[0])), \
+                       DEFAULT_ALIGNMENT)
 
-#define KB(SIZE) (SIZE << 10)
-#define MB(SIZE) (KB(SIZE) << 10)
+#define define_da(type, name) \
+    typedef struct name {          \
+        type *items;          \
+        size_t len;           \
+        size_t capacity;      \
+    } name
 
-#define define_da(type, name) typedef struct { \
-    type *items;                               \
-    size_t len;                                \
-    size_t capacity;                           \
-} name                                         \
-
-#define da_append(arena, array, item) do {                                                      \
-    if ((array)->len >= (array)->capacity) {                                                    \
-        size_t old_capacity = (array)->capacity;                                                \
-        if ((array)->capacity == 0) (array)->capacity = 1;                                      \
-        (array)->capacity *= 2;                                                                 \
-        (array)->items = arena_realloc(arena, (array)->items, old_capacity, (array)->capacity); \
-    }                                                                                           \
-    (array)->items[(array)->len] = item;                                                        \
-    (array)->len++;                                                                             \
-} while(0)
+#define da_append(arena, array, item)                                                               \
+    do {                                                                                            \
+        if ((array)->len >= (array)->capacity) {                                                    \
+            size_t old_capacity = (array)->capacity;                                                \
+            if ((array)->capacity == 0)                                                             \
+                (array)->capacity = 1;                                                              \
+            (array)->capacity *= 2;                                                                 \
+            (array)->items = arena_realloc(arena, (array)->items, old_capacity, (array)->capacity); \
+        }                                                                                           \
+        (array)->items[(array)->len] = item;                                                        \
+        (array)->len++;                                                                             \
+    } while (0)
 
 #define foreach(type, item, da) for (type *item = (da)->items; item < (da)->items + (da)->len; ++item)
 
@@ -72,10 +78,11 @@ void sakana_build_base(int argc, char **argv, char *src_path);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <sys/stat.h>
+#include <sys/wait.h>
 
 static Arena sakana_arena;
 
@@ -86,7 +93,7 @@ Arena alloc_arena(size_t size)
 
 Arena create_arena(void *ptr, size_t size)
 {
-    return (Arena){ .size = size, .data = ptr };
+    return (Arena) { .size = size, .data = ptr };
 }
 
 void delete_arena(Arena arena)
@@ -98,32 +105,28 @@ void *arena_base_alloc(Arena *arena, size_t size, size_t align)
 {
     size_t shift = 0;
     size_t mod = arena->next_position % align;
-    if (mod != 0) shift = align - mod;
-    arena->position =  arena->next_position + shift;
+    if (mod != 0)
+        shift = align - mod;
+    arena->position = arena->next_position + shift;
     assert(arena->position >= arena->next_position);
     assert((arena->position % align) == 0);
     arena->next_position = arena->position + size;
     assert(arena->next_position <= arena->size);
     memset(arena->data + arena->position, 0, size);
-    LOG("arena_base_alloc: size = %li, from position = %li, to position = %li, used = %ld%%\n",
-        size, arena->position, arena->next_position,
-        ((arena->next_position * 100) / arena->size));
+    LOG("arena_base_alloc: size = %li, from position = %li, to position = %li, used = %ld%%\n", size, arena->position,
+        arena->next_position, ((arena->next_position * 100) / arena->size));
     return arena->data + arena->position;
 }
 
 void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len, size_t align)
 {
     void *new_ptr = ptr;
-    if (ptr == (arena->data + arena->position))
-    {
+    if (ptr == (arena->data + arena->position)) {
         arena->next_position = arena->position + new_len;
         assert(arena->next_position <= arena->size);
-        LOG("arena_base_realloc: size = %li, from position = %li, to position = %li, used = %ld%%\n",
-            new_len, arena->position, arena->next_position,
-            ((arena->next_position * 100) / arena->size));
-    }
-    else
-    {
+        LOG("arena_base_realloc: size = %li, from position = %li, to position = %li, used = %ld%%\n", new_len,
+            arena->position, arena->next_position, ((arena->next_position * 100) / arena->size));
+    } else {
         new_ptr = arena_base_alloc(arena, new_len, align);
         memcpy(new_ptr, ptr, old_len);
     }
@@ -132,7 +135,7 @@ void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len
 
 Save quicksave(Arena arena)
 {
-    return (Save){ .position = arena.position, .next_position = arena.next_position };
+    return (Save) { .position = arena.position, .next_position = arena.next_position };
 }
 
 void quickload(Arena *arena, Save save)
@@ -144,20 +147,18 @@ void quickload(Arena *arena, Save save)
 int run_cmd(Cmd *cmd)
 {
     printf("run_cmd:");
-    foreach (char *, item, cmd) printf(" %s", *item);
+    foreach (char *, item, cmd)
+        printf(" %s", *item);
     printf("\n");
     assert(cmd->len > 0);
     cmd_append(cmd, NULL);
     pid_t pid = fork();
     assert(pid != -1);
-    if (pid == 0)
-    {
+    if (pid == 0) {
         execvp(cmd->items[0], cmd->items);
         fprintf(stderr, "run_cmd: failed to run subprocess\n");
         _exit(127);
-    }
-    else
-    {
+    } else {
         int status;
         waitpid(pid, &status, 0);
         cmd->len--;
@@ -184,7 +185,7 @@ static void sakana_atexit()
 
 void sakana_build_base(int argc, char **argv, char *src_path)
 {
-    (void)argc;
+    (void) argc;
     sakana_arena = alloc_arena(KB(1));
     atexit(sakana_atexit);
 
@@ -194,7 +195,7 @@ void sakana_build_base(int argc, char **argv, char *src_path)
     time_t src_time = get_last_modification(src_path);
 
     if (bin_time < src_time) {
-        Cmd cmd = {0};
+        Cmd cmd = { 0 };
         cmd_append(&cmd, "gcc");
         cmd_append(&cmd, src_path);
         cmd_append(&cmd, "-Wall");
@@ -204,7 +205,7 @@ void sakana_build_base(int argc, char **argv, char *src_path)
         cmd_append(&cmd, "-o");
         cmd_append(&cmd, bin_path);
         if (run_cmd(&cmd) == 0) {
-            Cmd run = {0};
+            Cmd run = { 0 };
             cmd_append(&run, bin_path);
             run_cmd(&run);
             exit(0);
@@ -212,5 +213,5 @@ void sakana_build_base(int argc, char **argv, char *src_path)
     }
 }
 
-#endif // SAKANA_IMPLEMENTATION
-#endif // SAKANA
+#endif  // SAKANA_IMPLEMENTATION
+#endif  // SAKANA
