@@ -33,7 +33,7 @@ typedef struct {
 Arena alloc_arena(size_t size);
 Arena create_arena(void *ptr, size_t size);
 void delete_arena(Arena arena);
-Save quicksave(Arena arena);
+Save quicksave(Arena *arena);
 void quickload(Arena *arena, Save save);
 void *arena_base_alloc(Arena *arena, size_t size, size_t align);
 void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len, size_t align);
@@ -44,7 +44,7 @@ void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len
                        DEFAULT_ALIGNMENT)
 
 #define define_da(type, name) \
-    typedef struct name {          \
+    typedef struct name {     \
         type *items;          \
         size_t len;           \
         size_t capacity;      \
@@ -133,9 +133,9 @@ void *arena_base_realloc(Arena *arena, void *ptr, size_t old_len, size_t new_len
     return new_ptr;
 }
 
-Save quicksave(Arena arena)
+Save quicksave(Arena *arena)
 {
-    return (Save) { .position = arena.position, .next_position = arena.next_position };
+    return (Save) { .position = arena->position, .next_position = arena->next_position };
 }
 
 void quickload(Arena *arena, Save save)
