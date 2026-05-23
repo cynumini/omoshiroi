@@ -19,31 +19,26 @@ typedef struct {
     size_t len;
 } StringView;
 
-StringView create_string_view(char *string)
+StringView string_view_create(char *string)
 {
     return (StringView) { .string = string, .len = strlen(string) };
 }
-
-void strip(StringView *sv)
+void string_view_strip(StringView *sv)
 {
-    while (sv->string[0] == ' ') {
+    if (sv->len == 0)
+        return;
+    while (isspace(sv->string[0])) {
         sv->string++;
         sv->len--;
         if (sv->len == 0)
             break;
     }
-    while (sv->string[sv->len - 1] == ' ') {
+    while (isspace(sv->string[sv->len - 1])) {
         sv->len--;
         if (sv->len == 0)
             break;
     }
 }
-
-typedef struct DatabaseManager {
-    const char *file;
-    const char *sql_path;
-    sqlite3 *db;
-} DatabaseManager;
 
 static bool is_file(const char *file)
 {
@@ -53,40 +48,20 @@ static bool is_file(const char *file)
     return S_ISREG(buf.st_mode);
 }
 
-int get_version(DatabaseManager self)
+int get_version(sqlite3 *db)
 {
     sqlite3_stmt *stmt = NULL;
-    assert(sqlite3_prepare_v2(self.db, "PRAGMA user_version;", -1, &stmt, NULL) == SQLITE_OK);
-    int result, version;
-    do {
-        result = sqlite3_step(stmt);
-        assert(result == SQLITE_DONE || result == SQLITE_BUSY || result == SQLITE_ROW);
-        if (result == SQLITE_ROW) {
-            version = sqlite3_column_int(stmt, 0);
-        }
-    } while (result != SQLITE_DONE);
+    assert(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, NULL) == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    int version = sqlite3_column_int(stmt, 0);
+    assert(sqlite3_step(stmt) == SQLITE_DONE);
     assert(sqlite3_finalize(stmt) == SQLITE_OK);
     return version;
 }
 
-void set_version(DatabaseManager self, int value)
+static void migrate(sqlite3 *db)
 {
-    sqlite3_stmt *stmt = NULL;
-    char sql[256] = { 0 };
-    sprintf(sql, "PRAGMA user_version = %d;", value);
-    assert(sqlite3_prepare_v2(self.db, sql, -1, &stmt, NULL) == SQLITE_OK);
-    sqlite3_bind_int(stmt, 1, value);
-    int result;
-    do {
-        result = sqlite3_step(stmt);
-        assert(result == SQLITE_DONE || result == SQLITE_BUSY);
-    } while (result != SQLITE_DONE);
-    assert(sqlite3_finalize(stmt) == SQLITE_OK);
-}
-
-static void migrate(DatabaseManager self)
-{
-    int version = get_version(self);
+    int version = get_version(db);
     if (version == 0) {
         printf("migrate from 0 to 1\n");
         const char *sql =
@@ -129,26 +104,32 @@ static void migrate(DatabaseManager self)
             "FROM log_old;\n"
             "DROP TABLE log_old;\n"
             "DROP TABLE media_old;\n"
+            "PRAGMA user_version = 1;\n"
             "COMMIT;";
-        assert(sqlite3_exec(self.db, sql, NULL, NULL, NULL) == SQLITE_OK);
-        set_version(self, 1);
+        assert(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
     }
 }
 
-char *join_path(Arena *arena, const char *p1, const char *p2)
+char *join_path(Arena *arena, const char *s1, const char *s2)
 {
-    char *result = arena_alloc(arena, char, strlen(p1) + strlen(p2) + 2);
-    sprintf(result, "%s/%s", p1, p2);
+    size_t s1_len = strlen(s1);
+    size_t len = s1_len + strlen(s2) + 1;
+    bool have_slash = s1[s1_len - 1] == '/';
+    if (!have_slash)
+        len++;
+    char *result = arena_alloc(arena, char, len);
+    strcat(result, s1);
+    if (!have_slash)
+        strcat(result, "/");
+    strcat(result, s2);
     return result;
 }
 
-static DatabaseManager create_database_manager(Arena *arena)
+static sqlite3 *open_database(const char *path)
 {
-    const char *home_path = getenv("HOME");
-    DatabaseManager self = { .file = join_path(arena, home_path, "org/elo.db"),
-                             .sql_path = join_path(arena, home_path, "org/elo.sql") };
-    bool exist = is_file(self.file);
-    assert(sqlite3_open(self.file, &self.db) == SQLITE_OK);
+    sqlite3 *db;
+    bool exist = is_file(path);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
     if (!exist) {
         const char *sql = "BEGIN;\n"
                           "CREATE TABLE media (\n"
@@ -176,20 +157,12 @@ static DatabaseManager create_database_manager(Arena *arena)
                           "    PRIMARY KEY(id AUTOINCREMENT),\n"
                           "    FOREIGN KEY(parent_id) REFERENCES media(id)\n"
                           ") STRICT;\n"
+                          "PRAGMA user_version = 0;\n"
                           "COMMIT;";
-        assert(sqlite3_exec(self.db, sql, NULL, NULL, NULL) == SQLITE_OK);
+        assert(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
     }
-    migrate(self);
-    return self;
-}
-
-// WIP
-static void destroy_database_manager(Arena *arena, DatabaseManager self)
-{
-    sqlite3_close(self.db);
-    char *result = arena_alloc(arena, char, strlen("sqlite3 .dump >") + strlen(self.file) + strlen(self.sql_path) + 1);
-    sprintf(result, "sqlite3 %s .dump > %s", self.file, self.sql_path);
-    assert(system(result) == 0);
+    migrate(db);
+    return db;
 }
 
 static char *arena_strdup(Arena *arena, const char *src)
@@ -200,79 +173,82 @@ static char *arena_strdup(Arena *arena, const char *src)
     return dest;
 }
 
-static Strings get_names(Arena *arena, DatabaseManager dm)
+static void string_view_bind(sqlite3_stmt *stmt, int index, StringView sv, bool null_on_zero_len)
 {
-    sqlite3_stmt *stmt = NULL;
-    assert(sqlite3_prepare_v2(dm.db, "SELECT name FROM media", -1, &stmt, NULL) == SQLITE_OK);
-    Strings names = {};
-    int step;
-    while (true) {
-        step = sqlite3_step(stmt);
-        if (step == SQLITE_DONE)
-            break;
-        da_append(arena, &names, arena_strdup(arena, (const char *) sqlite3_column_text(stmt, 0)));
+    if (null_on_zero_len && sv.len == 0) {
+        assert(sqlite3_bind_text(stmt, index, NULL, -1, SQLITE_STATIC) == SQLITE_OK);
+        return;
     }
-    assert(sqlite3_finalize(stmt) == SQLITE_OK);
-    return names;
+    assert(sqlite3_bind_text(stmt, index, sv.string, (int) sv.len, SQLITE_STATIC) == SQLITE_OK);
 }
 
-static Strings get_kinds(Arena *arena, DatabaseManager dm)
-{
-    sqlite3_stmt *stmt = NULL;
-    assert(sqlite3_prepare_v2(dm.db, "SELECT DISTINCT kind FROM media", -1, &stmt, NULL) == SQLITE_OK);
-    Strings types = {};
-    int step;
-    while (true) {
-        step = sqlite3_step(stmt);
-        if (step == SQLITE_DONE)
-            break;
-        da_append(arena, &types, arena_strdup(arena, (const char *) sqlite3_column_text(stmt, 0)));
-    }
-    assert(sqlite3_finalize(stmt) == SQLITE_OK);
-    return types;
-}
-
-// WIP
-static void add(DatabaseManager dm, StringView name, StringView kind, const char *release, bool japanese, int state,
-                const char *note)
+static void add(sqlite3 *db, StringView name, StringView kind, StringView release, bool japanese, int state,
+                StringView note)
 {
     sqlite3_stmt *stmt = NULL;
     const char *sql = "INSERT INTO media (name, kind, release, japanese, state, note) "
                       "VALUES (?, ?, ?, ?, ?, ?)";
-    assert(sqlite3_prepare_v2(dm.db, sql, -1, &stmt, NULL) == SQLITE_OK);
-    assert(sqlite3_bind_text(stmt, 1, name.string, (int) name.len, SQLITE_STATIC) == SQLITE_OK);
-    assert(sqlite3_bind_text(stmt, 2, kind.string, (int) kind.len, SQLITE_STATIC) == SQLITE_OK);
-    assert(sqlite3_bind_text(stmt, 3, release, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK);
+    string_view_bind(stmt, 1, name, false);
+    string_view_bind(stmt, 2, kind, false);
+    string_view_bind(stmt, 3, release, false);
     assert(sqlite3_bind_int(stmt, 4, japanese) == SQLITE_OK);
     assert(sqlite3_bind_int(stmt, 5, state) == SQLITE_OK);
-    assert(sqlite3_bind_text(stmt, 6, note, -1, SQLITE_STATIC) == SQLITE_OK);
+    string_view_bind(stmt, 6, note, true);
     int result;
+    bool is_print_busy_needed = true;
     do {
         result = sqlite3_step(stmt);
         assert(result == SQLITE_DONE || result == SQLITE_BUSY);
+        if (result == SQLITE_BUSY && is_print_busy_needed) {
+            printf("Database is busy!\n");
+            is_print_busy_needed = false;
+        }
     } while (result != SQLITE_DONE);
     assert(sqlite3_finalize(stmt) == SQLITE_OK);
 }
 
-static Strings *compentry_func_strings;
-
-static char *entry_func(const char *text, int index)
+static char *arena_readline(Arena *arena, const char *prompt)
 {
-    static size_t len, i;
-    if (index == 0) {
-        len = strlen(text);
-        i = 0;
-    }
-    while (i < compentry_func_strings->len) {
-        const char *option = compentry_func_strings->items[i++];
-        if (strncmp(option, text, len) == 0) {
-            return strdup(option);
-        }
-    }
-    return NULL;
+    Save save = quicksave(arena);
+    size_t n = strlen(prompt) + strlen(": ") + 1;
+    char *fancy_prompt = arena_alloc(arena, char *, n);
+    strcat(fancy_prompt, prompt);
+    strcat(fancy_prompt, ": ");
+    char *tmp = readline(fancy_prompt);
+    quickload(arena, save);
+    char *result = arena_strdup(arena, tmp);
+    free(tmp);
+    return result;
 }
 
-static char **completion_function(const char *text, int start, int end)
+static Arena arena;
+
+static sqlite3_stmt *sql_entry_func_stmt = NULL;
+
+static char *sql_entry_func(const char *text, int index)
+{
+    if (index == 0) {
+        assert(sqlite3_reset(sql_entry_func_stmt) == SQLITE_OK);
+        Save save = quicksave(&arena);
+        size_t len = strlen(text) + 1;
+        char *parameter = arena_alloc(&arena, char, len + 1);
+        strcat(parameter, text);
+        strcat(parameter, "%");
+        assert(sqlite3_bind_text(sql_entry_func_stmt, 1, parameter, (int) len, SQLITE_TRANSIENT) == SQLITE_OK);
+        quickload(&arena, save);
+    }
+    int result = sqlite3_step(sql_entry_func_stmt);
+    if (result == SQLITE_ROW) {
+        char *value = (char *) sqlite3_column_text(sql_entry_func_stmt, 0);
+        return strdup(value);
+    } else if (result == SQLITE_DONE) {
+        return NULL;
+    }
+    assert(false);
+}
+
+static char **sql_completion_function(const char *text, int start, int end)
 {
     UNUSED(start);
     UNUSED(end);
@@ -280,26 +256,17 @@ static char **completion_function(const char *text, int start, int end)
     rl_attempted_completion_over = 1;
     rl_completion_append_character = '\0';
     rl_completer_word_break_characters = "";
-    return rl_completion_matches(text, entry_func);
+    return rl_completion_matches(text, sql_entry_func);
 }
 
-static const char *get_prompt(Arena *arena, const char *prompt)
+static StringView prompt_sql(const char *prompt, sqlite3 *db, const char *sql)
 {
-    size_t n = strlen(prompt) + strlen(": ") + 1;
-    char *s = arena_alloc(arena, char *, n);
-    sprintf(s, "%s: ", prompt);
-    return s;
-}
-
-static StringView prompt_readline(Arena *arena, const char *prompt, Strings options)
-{
-    compentry_func_strings = &options;
-    rl_attempted_completion_function = completion_function;
-    const char *src = readline(get_prompt(arena, prompt));
-    char *string = arena_strdup(arena, src);
-    free((void *) src);
-    StringView sv = create_string_view(string);
-    strip(&sv);
+    assert(sqlite3_prepare_v2(db, sql, -1, &sql_entry_func_stmt, NULL) == SQLITE_OK);
+    rl_attempted_completion_function = sql_completion_function;
+    char *string = arena_readline(&arena, prompt);
+    assert(sqlite3_finalize(sql_entry_func_stmt) == SQLITE_OK);
+    StringView sv = string_view_create(string);
+    string_view_strip(&sv);
     return sv;
 }
 
@@ -332,20 +299,18 @@ unsigned int month_to_int(const char *m)
     return 0;
 }
 
-static const char *prompt_date(Arena *arena, const char *prompt)
+static StringView prompt_date(const char *prompt)
 {
     rl_bind_key('\t', rl_insert);
-    char *result = arena_alloc(arena, char, strlen("0000-00-00") + 1);
-    unsigned int y, m, d;
-    char buffer[32] = { 0 };
-    char rest;
-    const char *src = NULL;
-    while (true) {
-        if (src != NULL) {
-            free((char *) src);
-        }
-        src = readline(get_prompt(arena, prompt));
-        bool fail = !(sscanf(src, "%31s %u, %u%c", buffer, &d, &y, &rest) == 3);
+    char *result = arena_alloc(&arena, char, strlen("0000-00-00") + 1);
+    bool fail;
+    do {
+        Save save = quicksave(&arena);
+        const char *src = arena_readline(&arena, prompt);
+        char buffer[16] = {};
+        unsigned int y, m, d;
+        char rest;
+        fail = !(sscanf(src, "%15s %u, %u%c", buffer, &d, &y, &rest) == 3);
         if (!fail) {
             m = month_to_int(buffer);
             fail = m == 0;
@@ -356,81 +321,78 @@ static const char *prompt_date(Arena *arena, const char *prompt)
         if (fail) {
             fail = !(sscanf(src, "%u-%u-%u%c", &y, &m, &d, &rest) == 3);
         }
+        quickload(&arena, save);
         if (!fail && (m > 12 || d > 31 || y > 9999)) {
             fail = true;
         }
         if (!fail) {
             sprintf(result, "%04u-%02u-%02u", y, m, d);
-            break;
         }
-    }
-    free((void *) src);
-    return result;
+    } while (fail);
+    return string_view_create(result);
 }
 
-static bool prompt_check(Arena *arena, const char *prompt)
+static bool prompt_check(const char *prompt)
 {
     rl_bind_key('\t', rl_insert);
-    size_t n = strlen(prompt) + strlen(" (y/n): ") + 1;
-    char *s = arena_alloc(arena, char *, n);
-    sprintf(s, "%s (y/n): ", prompt);
     while (true) {
-        const char *src = readline(s);
+        Save save = quicksave(&arena);
+        const char *src = arena_readline(&arena, prompt);
         if (strlen(src) == 0) {
-            free((char *) src);
+            quickload(&arena, save);
             continue;
         }
-        if (src[0] == 'y' || src[0] == 'Y') {
-            free((char *) src);
+        char r = src[0];
+        quickload(&arena, save);
+        if (r == 'y' || r == 'Y') {
             return true;
-        } else if (src[0] == 'n' || src[0] == 'N') {
-            free((char *) src);
+        } else if (r == 'n' || r == 'N') {
             return false;
         }
-        free((char *) src);
     }
 }
 
-static const char *prompt(Arena *arena, const char *prompt, bool empty_ok)
+static StringView prompt(const char *prompt, bool empty_ok)
 {
     rl_bind_key('\t', rl_insert);
     while (true) {
-        const char *s = readline(get_prompt(arena, prompt));
+        const char *s = arena_readline(&arena, prompt);
         size_t len = strlen(s);
         if (len || empty_ok) {
-            if (len == 0) {
-                free((char *) s);
-                return NULL;
-            }
-            char *result = arena_strdup(arena, s);
-            free((char *) s);
-            return result;
+            return string_view_create(arena_strdup(&arena, s));
         }
-        free((char *) s);
     }
 }
 
 int main()
 {
-    Arena arena = alloc_arena(MB(1));
-    DatabaseManager dm = create_database_manager(&arena);
-    // TODO: add args parsing instead of manual input
-    StringView name = prompt_readline(&arena, "Name", get_names(&arena, dm));
-    StringView kind = prompt_readline(&arena, "Kind", get_kinds(&arena, dm));
-    const char *release = prompt_date(&arena, "Release");
-    bool japanese = prompt_check(&arena, "Will I consume it in Japanese?");
+    arena = alloc_arena(KB(640));
+
+    const char *home_path = getenv("HOME");
+    const char *database_path = join_path(&arena, home_path, "org/elo.db");
+    sqlite3 *db = open_database(database_path);
+
+    StringView name = prompt_sql("Name", db, "SELECT name FROM media WHERE name LIKE ?");
+    StringView kind = prompt_sql("Kind", db, "SELECT DISTINCT kind FROM media WHERE kind LIKE ?");
+    StringView release = prompt_date("Release");
+    bool japanese = prompt_check("Will I consume it in Japanese? (y/n)");
+
     int state = 0;
-    bool completed = prompt_check(&arena, "Completed?");
+    bool completed = prompt_check("Completed? (y/n)");
+
     if (completed) {
-        if (prompt_check(&arena, "Want to re-experience?")) {
+        if (prompt_check("Want to re-experience? (y/n)")) {
             state = 1;
         } else {
             state = 2;
         }
     }
-    const char *note = prompt(&arena, "Note", true);
-    add(dm, name, kind, release, japanese, state, note);
-    destroy_database_manager(&arena, dm);
+
+    StringView note = prompt("Note", true);
+
+    add(db, name, kind, release, japanese, state, note);
+
+    sqlite3_close(db);
     delete_arena(arena);
     return 0;
 }

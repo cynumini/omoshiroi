@@ -16,6 +16,7 @@ int main(int argc, char **argv)
         cmd_append(&build, "-Wextra");
         cmd_append(&build, "-Wpedantic");
         cmd_append(&build, "-Wconversion");
+        cmd_append(&build, "-g");
         cmd_append(&build, "-lsqlite3");
         cmd_append(&build, "-lreadline");
         // cmd_append(&build, "-fsanitize=address");
